@@ -6,11 +6,13 @@
 
 ## 快速開始
 
-Windows PowerShell 5.1（或相容 PowerShell）及 .NET ZIP API，不需 Docker、VM 或額外套件。
+Windows PowerShell 5.1（或相容的 Windows PowerShell 環境）及 .NET ZIP API，不需 Docker、VM 或額外套件。檔案安全檢查使用 Win32 file identity 與 `Add-Type`，需允許該操作的 PowerShell language mode；工具不繞過組織的 execution policy。
 
 ```powershell
 powershell -NoProfile -File ./scripts/Demo.ps1
 powershell -NoProfile -File ./tests/Run.Tests.ps1
+powershell -NoProfile -File ./tests/Safety.Tests.ps1
+powershell -NoProfile -File ./tests/Interruption.Tests.ps1
 ```
 
 DEMO 對 v1、v2 各 build 一次，再分別組裝 node-a、node-b 套件；真實建立 ZIP、驗證 manifest、投遞、快照、檔案換版及復原，服務操作為模擬。輸出保留在 `.work/` 的唯一目錄，不刪除既有資料。
@@ -28,6 +30,8 @@ DEMO 對 v1、v2 各 build 一次，再分別組裝 node-a、node-b 套件；真
 - [真實 legacy Java 接入案例](examples/legacy-java/README.md)：固定來源的 eXist／WSO2 評估與 ImageJ loose-class 編譯、loader、檔案部署驗證。
 
 ## 限制與安全邊界
+
+檔案 safety checks 拒絕 reparse points 與 hard links，包括 protected／state 範圍內的別名。所有 run journals 都參與未完成操作判斷；`current.json` 只是索引，不能掩蓋 orphan run。程序 kill、復原 kill／失敗及模擬服務啟停失敗由獨立測試覆蓋，仍不等於突然斷電保證。
 
 本地測試不表示正式環境權限、ACL、服務、檔案鎖定及 GitLab runner 已驗收。Hash 用於一致性，不等於來源簽章。CLI 確認／GitLab manual job 不取代公司核准與存取控制。
 

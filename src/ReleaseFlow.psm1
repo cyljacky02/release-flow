@@ -2,7 +2,7 @@
 # Hashes detect changes, not provenance. Journaling is not a power-loss guarantee.
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$script:RfToolVersion = '0.1.0-demo'
+$script:RfToolVersion = '0.1.1-demo'
 $script:RfModulePath = $PSCommandPath
 
 function Stop-Rf($Code, $Message) { throw "RF_${Code}: $Message" }
@@ -24,8 +24,55 @@ function ConvertTo-RfMap($Value) {
     }
     return $Value
 }
+function Get-RfToolVersion { return $script:RfToolVersion }
+function Assert-RfSingleLink($Path) {
+    if (-not [IO.File]::Exists($Path)) { return }
+    if ($env:OS -ne 'Windows_NT') { Stop-Rf 'UnsupportedPlatform' 'Hard-link validation currently requires Windows.' }
+    if (-not ('ReleaseFlow.NativeFileIdentity' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+namespace ReleaseFlow {
+    public static class NativeFileIdentity {
+        [StructLayout(LayoutKind.Sequential)]
+        private struct Info {
+            public uint Attributes;
+            public System.Runtime.InteropServices.ComTypes.FILETIME Creation;
+            public System.Runtime.InteropServices.ComTypes.FILETIME Access;
+            public System.Runtime.InteropServices.ComTypes.FILETIME Write;
+            public uint Volume, SizeHigh, SizeLow, Links, IndexHigh, IndexLow;
+        }
+        [DllImport("kernel32.dll", SetLastError=true)]
+        private static extern bool GetFileInformationByHandle(SafeFileHandle handle, out Info info);
+        public static uint LinkCount(SafeFileHandle handle) {
+            Info info;
+            if (!GetFileInformationByHandle(handle, out info)) throw new Win32Exception(Marshal.GetLastWin32Error());
+            return info.Links;
+        }
+    }
+}
+'@
+    }
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+    try { if ([ReleaseFlow.NativeFileIdentity]::LinkCount($stream.SafeFileHandle) -ne 1) { Stop-Rf 'HardLink' "Multiple file names refer to $Path; hard links are unsupported." } }
+    finally { $stream.Dispose() }
+}
+function Assert-RfSafePath {
+    [CmdletBinding()] param([Parameter(Mandatory)][string]$Path, [switch]$Recurse)
+    $full = Get-RfFullPath $Path
+    Assert-RfNoReparse $full
+    if ([IO.File]::Exists($full)) { Assert-RfSingleLink $full }
+    elseif ($Recurse -and [IO.Directory]::Exists($full)) { [void](Get-RfInventory $full '' $true) }
+}
+function Assert-RfRelativePath {
+    [CmdletBinding()] param([Parameter(Mandatory)][string]$Path)
+    [void](Get-RfRelative $Path)
+}
 function Read-RfJson($Path) {
     Assert-RfNoReparse $Path
+    Assert-RfSingleLink $Path
     if (-not [IO.File]::Exists($Path)) { Stop-Rf 'MissingFile' $Path }
     try { return ConvertTo-RfMap (ConvertFrom-Json -InputObject ([IO.File]::ReadAllText($Path))) }
     catch { Stop-Rf 'InvalidJson' "$Path : $_" }
@@ -33,6 +80,7 @@ function Read-RfJson($Path) {
 function Get-RfJson($Value) { return ConvertTo-Json -InputObject $Value -Depth 60 -Compress }
 function Write-RfJson($Path, $Value) {
     Assert-RfNoReparse $Path
+    Assert-RfSingleLink $Path
     $parent = [IO.Path]::GetDirectoryName($Path)
     [void][IO.Directory]::CreateDirectory($parent)
     $temp = Join-Path $parent ([IO.Path]::GetRandomFileName())
@@ -52,6 +100,7 @@ function Write-RfJson($Path, $Value) {
 }
 function Get-RfHash($Path) {
     Assert-RfNoReparse $Path
+    Assert-RfSingleLink $Path
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 function Get-RfTextHash($Text) {
@@ -103,7 +152,7 @@ function Test-RfScope($Path, $Scopes) {
     }
     return $false
 }
-function Get-RfInventory($Root, $ExcludePath = '', $ValidateOnly = $false) {
+function Get-RfInventory($Root, $ExcludePath = '', $ValidateOnly = $false, $AllowLockedPath = '') {
     Assert-RfNoReparse $Root
     if (-not [IO.Directory]::Exists($Root)) { Stop-Rf 'MissingDirectory' $Root }
     $files = @(); $seen = @{}
@@ -117,8 +166,11 @@ function Get-RfInventory($Root, $ExcludePath = '', $ValidateOnly = $false) {
             $relative = Get-RfRelative ($item.FullName.Substring($Root.Length + 1))
             if ($seen.ContainsKey($relative)) { Stop-Rf 'CaseCollision' $relative }; $seen[$relative] = $true
             if ($item.PSIsContainer) { $queue.Enqueue($item.FullName) }
-            elseif ($item.FullName -ne $ExcludePath -and -not $ValidateOnly) {
-                $files += [ordered]@{ Path = $relative; Sha256 = Get-RfHash $item.FullName; Length = [long]$item.Length }
+            else {
+                if ($item.FullName -ne $AllowLockedPath) { Assert-RfSingleLink $item.FullName }
+                if ($item.FullName -ne $ExcludePath -and -not $ValidateOnly) {
+                    $files += [ordered]@{ Path = $relative; Sha256 = Get-RfHash $item.FullName; Length = [long]$item.Length }
+                }
             }
         }
     }
@@ -187,7 +239,7 @@ function Read-RfConfig($Path) {
     }
     # Scan to reject junctions and case collisions, including retained content (conservative).
     [void](Get-RfInventory $c.ProductionPath '' $true)
-    if ([IO.Directory]::Exists($c.StatePath)) { [void](Get-RfInventory $c.StatePath '' $true) }
+    if ([IO.Directory]::Exists($c.StatePath)) { [void](Get-RfInventory $c.StatePath '' $true (Join-Path $c.StatePath 'target.lock')) }
     $c['_ConfigPath'] = $full
     return $c
 }
@@ -195,7 +247,10 @@ function Enter-RfLock($Config) {
     Assert-RfNoReparse $Config.StatePath
     [void][IO.Directory]::CreateDirectory($Config.StatePath)
     $path = Join-Path $Config.StatePath 'target.lock'; Assert-RfNoReparse $path
-    try { return [IO.File]::Open($path, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
+    try {
+        Assert-RfSingleLink $path
+        return [IO.File]::Open($path, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    }
     catch { Stop-Rf 'TargetLocked' 'Another executor holds the target lock (or the state directory is inaccessible).' }
 }
 function Get-RfCurrent($Config) {
@@ -206,9 +261,46 @@ function Get-RfCurrent($Config) {
     if (-not [guid]::TryParse([string]$pointer.RunId, [ref]$id)) { Stop-Rf 'InvalidJournal' 'Invalid run pointer.' }
     return Read-RfJson (Join-Path $Config.StatePath "runs/$id/journal.json")
 }
+function Get-RfRuns($Config) {
+    $root = Join-Path $Config.StatePath 'runs'
+    if (-not [IO.Directory]::Exists($root)) { return @() }
+    $runs = @()
+    foreach ($directory in @(Get-ChildItem -LiteralPath $root -Directory -Force)) {
+        $id = [guid]::Empty
+        if (-not [guid]::TryParse($directory.Name, [ref]$id)) { Stop-Rf 'InvalidJournal' 'Unexpected run directory.' }
+        $journal = Join-Path $directory.FullName 'journal.json'
+        if (-not [IO.File]::Exists($journal)) { Stop-Rf 'IncompleteRun' "Run $id has no durable journal; manual inspection required." }
+        $run = Read-RfJson $journal
+        if ($run.SchemaVersion -ne 1 -or $run.RunId -ne $id.ToString() -or $run.TargetId -cne $Config.TargetId -or $run.ProductionPath -ne $Config.ProductionPath) { Stop-Rf 'InvalidJournal' "Run identity mismatch at $id" }
+        $runs += $run
+    }
+    return @($runs)
+}
+function Get-RfPendingRuns($Config) {
+    return @(Get-RfRuns $Config | Where-Object { $_.Status -notin @('Succeeded','Recovered','AutoRecovered','Aborted') })
+}
 function Assert-RfComplete($Config) {
-    $run = Get-RfCurrent $Config
-    if ($null -ne $run -and $run.Status -notin @('Succeeded','Recovered','AutoRecovered')) { Stop-Rf 'IncompleteRun' "Run $($run.RunId) is $($run.Status); recovery/intervention required." }
+    $pending = @(Get-RfPendingRuns $Config)
+    if ($pending.Count -gt 0) { Stop-Rf 'IncompleteRun' "Run $($pending[0].RunId) is $($pending[0].Status); recovery/intervention required, including orphan journals." }
+    # Validate the pointer too; it is an index, not the authority for completeness.
+    [void](Get-RfCurrent $Config)
+}
+function Resolve-RfPreparation {
+    [CmdletBinding()] param([Parameter(Mandatory)][string]$TargetConfigPath, [Parameter(Mandatory)][guid]$RunId, [switch]$ConfirmExecution)
+    if (-not $ConfirmExecution) { Stop-Rf 'ConfirmationRequired' 'Explicit confirmation required to abandon an untouched preparation.' }
+    $c = Read-RfConfig $TargetConfigPath; $lock = Enter-RfLock $c
+    try {
+        $matches = @(Get-RfRuns $c | Where-Object { $_.RunId -eq $RunId.ToString() })
+        if ($matches.Count -ne 1) { Stop-Rf 'InvalidJournal' 'Preparation run not found.' }
+        $run = $matches[0]
+        if ($run.ToolVersion -ne $script:RfToolVersion -or $run.Status -ne 'Preparing' -or $run.BackupsComplete -or $run.StartupAttempted -or $run.ServiceEvents.Count -ne 0 -or $null -ne $run.ServiceIntent -or @($run.Operations | Where-Object { $_.State -ne 'Pending' }).Count -ne 0) { Stop-Rf 'UnsafePreparation' 'Only an untouched compatible Preparing run can be abandoned.' }
+        if ($run.TargetConfigSha256 -ne (Get-RfHash $c._ConfigPath)) { Stop-Rf 'ConfigChanged' 'Preparation definition changed.' }
+        Assert-RfInventoryEqual $run.BeforeManagedFiles (Get-RfManaged $c) 'Drift'
+        if ((Get-RfCanonical (Read-RfBaseline $c)) -cne (Get-RfCanonical $run.BaselineBefore) -or (Get-RfCanonical (Get-RfServices $c)) -cne (Get-RfCanonical $run.InitialServices)) { Stop-Rf 'UnsafePreparation' 'Baseline or services changed since preparation.' }
+        Set-RfPhase $c $run 'Aborted'
+        Write-RfReport $c $run
+        return [pscustomobject]$run
+    } finally { $lock.Dispose() }
 }
 function Read-RfBaseline($Config) {
     $path = Join-Path $Config.StatePath 'baseline.json'
@@ -403,10 +495,11 @@ function Get-RfServices($Config) {
     }
     return $services
 }
-function Set-RfServices($Config, $Run, $Start) {
+function Set-RfServices($Config, $Run, $Start, $FailBeforeTransition = $false) {
     $order = $Config.StopOrder; if ($Start) { $order = $Config.StartOrder }
     foreach ($n in $order) {
         $running = $false; if ($Start) { $running = $Run.InitialServices[$n] }
+        if ($FailBeforeTransition -and $Run.Services[$n] -ne $running) { Stop-Rf 'InjectedServiceFailure' "Simulated transition failed for $n (Running=$running)." }
         $Run.ServiceIntent = [ordered]@{ Name = $n; Running = $running }; Save-RfRun $Config $Run
         $Run.Services[$n] = $running
         Write-RfJson (Join-Path $Config.StatePath 'services.json') $Run.Services
@@ -428,6 +521,7 @@ function Set-RfAclMetadata($Path, $Sddl) {
 }
 function Copy-RfFile($Source, $Target, $Metadata = $null) {
     Assert-RfNoReparse $Source; Assert-RfNoReparse $Target
+    Assert-RfSingleLink $Source; Assert-RfSingleLink $Target
     [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($Target))
     # Overwrite in place to retain existing ACL; recovery restores captured metadata too.
     [IO.File]::Copy($Source, $Target, $true)
@@ -462,11 +556,35 @@ function Assert-RfRecoveryState($Config, $Run) {
     }
     foreach ($p in $a.Keys) { if (-not $original.ContainsKey($p) -and -not $changed.ContainsKey($p)) { Stop-Rf 'RecoveryDrift' "Unexpected managed file $p" } }
 }
-function Restore-RfRun($Config, $Run, $Automatic) {
+function Get-RfPausePath($Config, $Path, $PackagePath = '') {
+    if ([string]::IsNullOrWhiteSpace($Path)) { Stop-Rf 'InvalidTestProbe' 'PauseSignalPath is required when pausing a test process.' }
+    $full = Get-RfFullPath $Path
+    foreach ($root in @($Config.ProductionPath, $Config.StatePath, $PackagePath) | Where-Object { $_ }) {
+        if (Test-RfUnder $full $root) { Stop-Rf 'InvalidTestProbe' 'Test signal must be outside application, state and package roots.' }
+    }
+    Assert-RfSafePath -Path $full
+    if (Test-Path -LiteralPath $full) { Stop-Rf 'InvalidTestProbe' 'Use a fresh test signal path.' }
+    return $full
+}
+function Suspend-RfTestProcess($SignalPath, $Run) {
+    # Explicit fault-test seam: the test harness kills this child after seeing a durable signal.
+    Write-RfJson $SignalPath @{ RunId=$Run.RunId; ProcessId=$PID; Phase=$Run.Status }
+    while ($true) { [Threading.Thread]::Sleep(1000) }
+}
+function Abort-RfUnappliedRun($Config, $Run) {
+    if ($Run.StartupAttempted -or @($Run.Operations | Where-Object { $_.State -ne 'Pending' }).Count -gt 0) { Stop-Rf 'UnsafePreparation' 'Application operations already began.' }
+    Assert-RfInventoryEqual $Run.BeforeManagedFiles (Get-RfManaged $Config) 'Drift'
+    if ((Get-RfCanonical (Read-RfBaseline $Config)) -cne (Get-RfCanonical $Run.BaselineBefore)) { Stop-Rf 'BaselineChanged' 'Cannot abort changed baseline.' }
+    Set-RfServices $Config $Run $true
+    Set-RfPhase $Config $Run 'Aborted'
+    Write-RfReport $Config $Run
+}
+function Restore-RfRun($Config, $Run, $Automatic, $FailAfterFiles = [int]::MaxValue, $PauseAfterFiles = -1, $PauseSignalPath = '') {
     if (-not $Run.BackupsComplete) { Stop-Rf 'RecoveryDataIncomplete' 'Snapshot/originals were not completed; manual intervention required.' }
     Assert-RfRecoveryState $Config $Run
     Set-RfPhase $Config $Run 'Recovering'
     Set-RfServices $Config $Run $false
+    $restoredCount = 0
     foreach ($op in $Run.Operations) {
         $target = Join-RfPath $Config.ProductionPath $op.Path
         # Recheck immediately before each write, including a resumed recovery.
@@ -480,6 +598,9 @@ function Restore-RfRun($Config, $Run, $Automatic) {
         }
         if (-not (Test-RfSame (Get-RfFileState $target) $op.Before)) { Stop-Rf 'RecoveryVerificationFailed' $op.Path }
         $op.RecoveryState = 'Done'; Save-RfRun $Config $Run
+        $restoredCount++
+        if ($restoredCount -eq $PauseAfterFiles) { Suspend-RfTestProcess $PauseSignalPath $Run }
+        if ($restoredCount -ge $FailAfterFiles) { Stop-Rf 'InjectedRecoveryFailure' "After $restoredCount restored files." }
     }
     Assert-RfInventoryEqual $Run.BeforeManagedFiles (Get-RfManaged $Config) 'RecoveryVerificationFailed'
     Write-RfJson (Join-Path $Config.StatePath 'baseline.json') $Run.BaselineBefore
@@ -497,7 +618,11 @@ function Invoke-RfDeployment {
         [Parameter(Mandatory)][string]$PlanPath,
         [switch]$ConfirmExecution,
         [ValidateRange(0,2147483647)][int]$FailAfterFiles = 2147483647,
-        [switch]$FailHealthCheck
+        [switch]$FailHealthCheck,
+        [switch]$FailServiceStop,
+        [switch]$FailServiceStart,
+        [ValidateRange(-1,2147483647)][int]$PauseAfterFiles = -1,
+        [string]$PauseSignalPath
     )
     if (-not $ConfirmExecution) { Stop-Rf 'ConfirmationRequired' 'Supply -ConfirmExecution after reviewing the plan.' }
     $plan = Read-RfJson (Get-RfFullPath $PlanPath)
@@ -509,6 +634,7 @@ function Invoke-RfDeployment {
         Assert-RfComplete $c
         # Re-read config under lock, then recompute the complete approved plan.
         $c = Read-RfConfig $plan.TargetConfigPath
+        if ($PauseAfterFiles -ge 0) { $PauseSignalPath = Get-RfPausePath $c $PauseSignalPath $plan.PackagePath }
         $fresh = Get-RfPlanData $plan.PackagePath $c
         if ((Get-RfCanonical $fresh) -cne (Get-RfCanonical $plan)) { Stop-Rf 'PlanStale' 'Package, target definition, baseline or actual files changed; produce a new plan.' }
         if ($plan.NoOp) { return [pscustomobject]@{ Status = 'NoOp'; TargetId = $c.TargetId; Version = $plan.TargetVersion; RunId = $null } }
@@ -536,7 +662,7 @@ function Invoke-RfDeployment {
         # A self-contained recovery record does not rely on the delivery package.
         Write-RfJson (Join-Path $runRoot 'plan.json') $plan
         Save-RfRecoveryTools $c $runRoot
-        Set-RfPhase $c $run 'Stopping'; Set-RfServices $c $run $false
+        Set-RfPhase $c $run 'Stopping'; Set-RfServices $c $run $false ([bool]$FailServiceStop)
         Set-RfPhase $c $run 'BackingUp'
         Assert-RfInventoryEqual $run.BeforeManagedFiles (Get-RfManaged $c) 'Drift'
         foreach ($f in $run.BeforeManagedFiles) {
@@ -557,6 +683,7 @@ function Invoke-RfDeployment {
         }
         $run.BackupsComplete = $true; Set-RfPhase $c $run 'Applying'
         $count = 0
+        if ($PauseAfterFiles -eq 0) { Suspend-RfTestProcess $PauseSignalPath $run }
         if ($FailAfterFiles -eq 0) { Stop-Rf 'InjectedApplicationFailure' 'Before first operation.' }
         foreach ($op in $run.Operations) {
             if (-not (Test-RfSame (Get-RfFileState $op.TargetPath) $op.Before)) { Stop-Rf 'Drift' $op.Path }
@@ -570,13 +697,14 @@ function Invoke-RfDeployment {
             if (-not (Test-RfSame (Get-RfFileState $op.TargetPath) $op.After)) { Stop-Rf 'ApplyVerificationFailed' $op.Path }
             $op.State = 'Done'; Save-RfRun $c $run
             $count++
+            if ($count -eq $PauseAfterFiles) { Suspend-RfTestProcess $PauseSignalPath $run }
             if ($count -ge $FailAfterFiles) { Stop-Rf 'InjectedApplicationFailure' "After $count file operations." }
         }
         # Expected managed inventory also includes untouched untracked files.
         $expected = @($run.BeforeManagedFiles | Where-Object { -not (Test-RfScope $_.Path @($run.Operations | ForEach-Object { $_.Path })) })
         $expected += @($run.Operations | Where-Object { $null -ne $_.After } | ForEach-Object { $_.After })
         Assert-RfInventoryEqual $expected (Get-RfManaged $c) 'ApplyVerificationFailed'
-        $run.StartupAttempted = $true; Set-RfPhase $c $run 'Starting'; Set-RfServices $c $run $true
+        $run.StartupAttempted = $true; Set-RfPhase $c $run 'Starting'; Set-RfServices $c $run $true ([bool]$FailServiceStart)
         Set-RfPhase $c $run 'Verifying'
         if ($FailHealthCheck -or $c.HealthCheck.Fail) { Stop-Rf 'HealthCheckFailed' 'Simulated health check failed after startup.' }
         $b = [ordered]@{ SchemaVersion = 1; TargetId = $c.TargetId; ProductionPath = $c.ProductionPath; Version = $plan.TargetVersion; Commit = $plan.Package.Commit; LatestRunId = $id; Files = $plan.DesiredFiles }
@@ -599,6 +727,8 @@ function Invoke-RfDeployment {
                 if (-not $run.StartupAttempted -and $run.BackupsComplete) {
                     Set-RfPhase $c $run 'ApplicationFailed'
                     Restore-RfRun $c $run $true
+                } elseif (-not $run.StartupAttempted -and @($run.Operations | Where-Object { $_.State -ne 'Pending' }).Count -eq 0) {
+                    Abort-RfUnappliedRun $c $run
                 } else {
                     Set-RfPhase $c $run 'NeedsIntervention'; Set-RfServices $c $run $false
                     Write-RfReport $c $run
@@ -614,12 +744,18 @@ function Invoke-RfDeployment {
     } finally { $lock.Dispose() }
 }
 function Invoke-RfRecovery {
-    [CmdletBinding()] param([Parameter(Mandatory)][string]$TargetConfigPath, [switch]$ConfirmExecution)
+    [CmdletBinding()] param(
+        [Parameter(Mandatory)][string]$TargetConfigPath, [switch]$ConfirmExecution,
+        [ValidateRange(1,2147483647)][int]$FailAfterFiles = [int]::MaxValue,
+        [ValidateRange(-1,2147483647)][int]$PauseAfterFiles = -1, [string]$PauseSignalPath
+    )
     if (-not $ConfirmExecution) { Stop-Rf 'ConfirmationRequired' 'Supply -ConfirmExecution to restore the latest eligible run.' }
     $c = Read-RfConfig $TargetConfigPath; $lock = Enter-RfLock $c; $run = $null
     try {
         $run = Get-RfCurrent $c
-        if ($null -eq $run -or $run.Status -in @('Recovered','AutoRecovered')) { Stop-Rf 'RecoveryNotEligible' 'No latest unrecovered operation.' }
+        if ($PauseAfterFiles -ge 0) { $PauseSignalPath = Get-RfPausePath $c $PauseSignalPath }
+        if ($null -eq $run -or $run.Status -in @('Recovered','AutoRecovered','Aborted')) { Stop-Rf 'RecoveryNotEligible' 'No latest unrecovered operation.' }
+        if (@(Get-RfPendingRuns $c | Where-Object { $_.RunId -ne $run.RunId }).Count -gt 0) { Stop-Rf 'IncompleteRun' 'An orphan unfinished run needs resolution before recovery of the indexed run.' }
         if ($run.SchemaVersion -ne 1 -or $run.ToolVersion -ne $script:RfToolVersion -or $run.TargetId -cne $c.TargetId -or $run.ProductionPath -ne $c.ProductionPath) { Stop-Rf 'IncompatibleRecovery' 'Recovery schema/tool/target mismatch.' }
         if ($run.TargetConfigSha256 -ne (Get-RfHash $c._ConfigPath)) { Stop-Rf 'ConfigChanged' 'Recovery requires the unchanged target definition.' }
         $baseline = Read-RfBaseline $c
@@ -628,7 +764,7 @@ function Invoke-RfRecovery {
         $isOld = (Get-RfCanonical $baseline) -ceq (Get-RfCanonical $run.BaselineBefore)
         $isNew = $null -ne $run.BaselineAfter -and (Get-RfCanonical $baseline) -ceq (Get-RfCanonical $run.BaselineAfter)
         if (-not $isOld -and -not $isNew) { Stop-Rf 'BaselineChanged' 'Baseline is not a known state of the latest run.' }
-        Restore-RfRun $c $run $false
+        Restore-RfRun $c $run $false $FailAfterFiles $PauseAfterFiles $PauseSignalPath
         return [pscustomobject]$run
     } catch {
         $failure = $_
@@ -644,7 +780,7 @@ function Get-RfStatus {
     try {
         $run = Get-RfCurrent $c; $b = $null
         if ([IO.File]::Exists((Join-Path $c.StatePath 'baseline.json'))) { $b = Read-RfBaseline $c }
-        return [pscustomobject]@{ TargetId = $c.TargetId; Baseline = $b; CurrentRun = $run; Services = Get-RfServices $c; Mode = 'Simulated' }
+        return [pscustomobject]@{ TargetId = $c.TargetId; Baseline = $b; CurrentRun = $run; PendingRuns = @(Get-RfPendingRuns $c); Services = Get-RfServices $c; Mode = 'Simulated' }
     } finally { $lock.Dispose() }
 }
-Export-ModuleMember -Function New-RfManifest, New-RfBaseline, New-RfPlan, Invoke-RfDeployment, Invoke-RfRecovery, Get-RfStatus
+Export-ModuleMember -Function New-RfManifest, New-RfBaseline, New-RfPlan, Invoke-RfDeployment, Invoke-RfRecovery, Get-RfStatus, Get-RfToolVersion, Assert-RfSafePath, Assert-RfRelativePath, Resolve-RfPreparation

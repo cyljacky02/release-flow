@@ -9,6 +9,8 @@
 ```powershell
 powershell -NoProfile -File scripts/Demo.ps1
 powershell -NoProfile -File tests/Run.Tests.ps1
+powershell -NoProfile -File tests/Safety.Tests.ps1
+powershell -NoProfile -File tests/Interruption.Tests.ps1
 ```
 
 每次使用新的 `.work/` 子目錄，保留測試證據。範例 build 產生可執行的 PowerShell 示範應用，不是實際專案的 compiler；接入專案時替換 `scripts/Build.ps1` 的內容。
@@ -58,7 +60,14 @@ $plan = Join-Path $root 'approved-plan.json'
 - 嘗試啟動目標版本前的檔案失敗可自動復原；啟動後驗證失敗保留待處理狀態，需明確執行復原。
 - 只撤銷最近一次符合資格的操作，不跨多次歷史倒帶。
 - 升版與降版皆可撤銷；復原回到本次開始前的实际檔案狀態。
-- `.work/.../targets/<TargetId>/state` 保留 baseline、runs、操作紀錄與備份；不要手動移除未完成操作資料。
+- `.work/.../targets/<TargetId>/state` 保留 baseline、runs、操作紀錄與備份；不要手動移除未完成操作資料。`Status.PendingRuns` 包含 orphan journals，不能只看 `CurrentRun`。
+- 若 pointer 寫入失敗留下一筆完全未碰應用或服務的 `Preparing` run，可在確認原始 inventory、baseline、服務及設定未變後，明確執行 `ResolvePreparation`：
+
+  ```powershell
+  ./scripts/Deploy.ps1 -Action ResolvePreparation -TargetConfigPath $config -RunId '<Preparing RunId>' -ConfirmExecution
+  ```
+
+  此操作只把已驗證未異動的 preparation 標為 `Aborted`，不更動應用檔案／服務、不刪 journal。其他階段或缺少 journal 的 run 不得用它清除，需要既有人工決策流程。
 - 每個 run 包含 `report.json`、`report.txt`、快照及成功換版後的 `snapshot.zip`。ZIP 不包含 ACL 保證，復原以原檔案與 journal 中繼資料為準。
 - 每個 run 的 `tools/` 保存當次核心、非秘密環境設定及獨立復原入口；可在原始套件不存在時執行 `tools/Recover.ps1 -ConfirmExecution`。
 
@@ -80,4 +89,4 @@ $plan = Join-Path $root 'approved-plan.json'
 
 ## 驗證與後續驗收
 
-本地快速測試不涵蓋突然斷電、真實服務、完整存取控制、安全競態防護及跨機協調。待接入實際專案後，需在可丟棄 Windows 環境驗證 ACL／檔案鎖定／程序中斷、runner 投遞與公司權限分工。外部變更單與版本授權的技術綁定、備份保留／清理及完整空間預估亦需後續補強，不能因 DEMO 成功就宣稱 production ready。
+本地快速測試涵蓋在明確持久化邊界 kill deployment／recovery child process，及模擬 stop／start／recovery failure。測試 seam `PauseAfterFiles`／`PauseSignalPath` 只供隔離 fault tests，訊號檔須位於 application／state／package 範圍外；測試由新進程執行並有逾時與清理，不調整 execution policy。這不涵蓋突然斷電、真實服務、完整存取控制、安全競態防護及跨機協調。待接入實際專案後，需在可丟棄 Windows 環境驗證 ACL／檔案鎖定／程序中斷、runner 投遞與公司權限分工。外部變更單與版本授權的技術綁定、備份保留／清理及完整空間預估亦需後續補強，不能因 DEMO 成功就宣稱 production ready。
