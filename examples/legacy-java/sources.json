@@ -1,0 +1,20 @@
+{
+  "SchemaVersion": 1,
+  "Exist": {
+    "Repository": "eXist-db/exist",
+    "Commit": "3be6286d3085626fc9a7fd711be12f424367298f",
+    "Files": [
+      "build.bat", "BUILD.md", "build.properties", "build/scripts/build-impl.xml",
+      "tools/yajsw/build.xml", "tools/yajsw/conf/wrapper.conf.in",
+      "tools/yajsw/bin/installService.bat", "tools/yajsw/bin/startService.bat",
+      "tools/yajsw/bin/stopService.bat", "tools/yajsw/bin/setenv.bat",
+      "tools/yajsw/src/org/exist/yajsw/Main.java",
+      "src/org/exist/start/start.config",
+      "src/org/exist/plugin/PluginsManagerImpl.java"
+    ]
+  },
+  "ImageJ": {
+    "Repository": "imagej/ImageJ",
+    "Commit": "e52a4b2c888ed0170384706b3aa87af1b2f4e5c8"
+  }
+}

@@ -1,0 +1,82 @@
+# Opt-in sample ONLY; merge narrowly into an existing pipeline after runner review.
+# No service operation or production deployment job.
+stages: [build, package, delivery]
+variables:
+  LEGACY_IMAGEJ_CI_ENABLED: "false"
+  LEGACY_IMAGEJ_DELIVERY_ENABLED: "false"
+
+.legacy_imagej_job:
+  tags: [REPLACE_WITH_APPROVED_WINDOWS_RUNNER]
+  rules:
+    - if: '$LEGACY_IMAGEJ_CI_ENABLED == "true"'
+    - when: never
+
+imagej_build:
+  extends: .legacy_imagej_job
+  stage: build
+  script:
+    - '& ./scripts/legacy/Get-Sources.ps1 -Root .ci/legacy-sources'
+    - |
+      $source = Get-Content .ci/legacy-sources/acquisition.json -Raw | ConvertFrom-Json
+      & ./scripts/legacy/Build-ImageJ.ps1 -SourcePath $source.ImageJSourcePath -OutputPath .ci/imagej-build
+      & ./scripts/legacy/Verify-ImageJPlugin.ps1 -BuildPath .ci/imagej-build -OutputPath .ci/imagej-probe
+  artifacts:
+    paths:
+      - .ci/imagej-build/app/
+      - .ci/imagej-build/build.json
+      - .ci/imagej-build/build-attempt.json
+      - .ci/imagej-build/javac.log
+      - .ci/imagej-probe/probe-results.json
+      - .ci/legacy-sources/acquisition.json
+    expire_in: 14 days
+
+.imagej_package:
+  extends: .legacy_imagej_job
+  stage: package
+  needs:
+    - job: imagej_build
+      artifacts: true
+  script:
+    - '& ./scripts/Package.ps1 -BuildPath .ci/imagej-build -TargetId $env:TARGET_ID -TargetFilesPath "examples/legacy-java/imagej/targets/$($env:TARGET_ID)" -OutputPath ".ci/imagej-packages/$($env:TARGET_ID)"'
+  artifacts:
+    paths: [".ci/imagej-packages/$TARGET_ID/"]
+    expire_in: 14 days
+
+imagej_package_a:
+  extends: .imagej_package
+  variables:
+    TARGET_ID: legacy-node-a
+
+imagej_package_b:
+  extends: .imagej_package
+  variables:
+    TARGET_ID: legacy-node-b
+
+.imagej_delivery:
+  tags: [REPLACE_WITH_APPROVED_WINDOWS_RUNNER]
+  stage: delivery
+  rules:
+    - if: '$LEGACY_IMAGEJ_CI_ENABLED == "true" && $LEGACY_IMAGEJ_DELIVERY_ENABLED == "true"'
+      when: manual
+    - when: never
+  script:
+    - |
+      if ([string]::IsNullOrWhiteSpace($env:LEGACY_IMAGEJ_INBOX_BASE)) { throw 'Approved fixture inbox required; never a production path.' }
+      $zip = ".ci/imagej-packages/$($env:TARGET_ID)/$($env:TARGET_ID).zip"
+      & ./scripts/Deliver.ps1 -ArchivePath $zip -ExpectedSha256 ((Get-Content "$zip.sha256" -Raw).Trim()) -DestinationPath (Join-Path $env:LEGACY_IMAGEJ_INBOX_BASE "$($env:TARGET_ID)/$($env:CI_PIPELINE_ID)")
+
+imagej_delivery_a:
+  extends: .imagej_delivery
+  variables:
+    TARGET_ID: legacy-node-a
+  needs:
+    - job: imagej_package_a
+      artifacts: true
+
+imagej_delivery_b:
+  extends: .imagej_delivery
+  variables:
+    TARGET_ID: legacy-node-b
+  needs:
+    - job: imagej_package_b
+      artifacts: true
