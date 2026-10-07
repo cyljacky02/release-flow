@@ -2,7 +2,7 @@
 # Hashes detect changes, not provenance. Journaling is not a power-loss guarantee.
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$script:RfToolVersion = '0.1.1-demo'
+$script:RfToolVersion = '0.1.2-demo'
 $script:RfModulePath = $PSCommandPath
 
 function Stop-Rf($Code, $Message) { throw "RF_${Code}: $Message" }
@@ -284,6 +284,26 @@ function Assert-RfComplete($Config) {
     if ($pending.Count -gt 0) { Stop-Rf 'IncompleteRun' "Run $($pending[0].RunId) is $($pending[0].Status); recovery/intervention required, including orphan journals." }
     # Validate the pointer too; it is an index, not the authority for completeness.
     [void](Get-RfCurrent $Config)
+}
+function Get-RfRecoveryCandidate($Config) {
+    $run = Get-RfCurrent $Config
+    $seen = @{}
+    while ($null -ne $run -and $run.Status -eq 'Aborted') {
+        if ($seen.ContainsKey($run.RunId)) { Stop-Rf 'InvalidJournal' 'Recovery lineage contains a cycle.' }
+        $seen[$run.RunId] = $true
+        # Skip only proven untouched attempts, never actual recovered deployments.
+        if ($run.ToolVersion -ne $script:RfToolVersion -or $run.StartupAttempted -or $null -ne $run.BaselineAfter -or @($run.Operations | Where-Object { $_.State -ne 'Pending' -or $_.RecoveryState -ne 'Pending' }).Count -gt 0 -or -not $run.Contains('PreviousRunId')) { Stop-Rf 'RecoveryNotEligible' 'Aborted attempt has no compatible untouched lineage.' }
+        if ($run.TargetConfigSha256 -ne (Get-RfHash $Config._ConfigPath)) { Stop-Rf 'ConfigChanged' 'Aborted attempt definition changed.' }
+        Assert-RfInventoryEqual $run.BeforeManagedFiles (Get-RfManaged $Config) 'RecoveryDrift'
+        if ((Get-RfCanonical (Read-RfBaseline $Config)) -cne (Get-RfCanonical $run.BaselineBefore) -or (Get-RfCanonical (Get-RfServices $Config)) -cne (Get-RfCanonical $run.InitialServices)) { Stop-Rf 'RecoveryDrift' 'Aborted attempt no longer matches its untouched baseline/services.' }
+        if ($null -eq $run.PreviousRunId) { return $null }
+        $previous = [guid]::Empty
+        if (-not [guid]::TryParse([string]$run.PreviousRunId, [ref]$previous)) { Stop-Rf 'InvalidJournal' 'Invalid previous run identity.' }
+        $matches = @(Get-RfRuns $Config | Where-Object { $_.RunId -eq $previous.ToString() })
+        if ($matches.Count -ne 1) { Stop-Rf 'InvalidJournal' 'Previous run is missing.' }
+        $run = $matches[0]
+    }
+    return $run
 }
 function Resolve-RfPreparation {
     [CmdletBinding()] param([Parameter(Mandatory)][string]$TargetConfigPath, [Parameter(Mandatory)][guid]$RunId, [switch]$ConfirmExecution)
@@ -621,6 +641,7 @@ function Invoke-RfDeployment {
         [switch]$FailHealthCheck,
         [switch]$FailServiceStop,
         [switch]$FailServiceStart,
+        [switch]$PauseAtPreparation,
         [ValidateRange(-1,2147483647)][int]$PauseAfterFiles = -1,
         [string]$PauseSignalPath
     )
@@ -634,7 +655,7 @@ function Invoke-RfDeployment {
         Assert-RfComplete $c
         # Re-read config under lock, then recompute the complete approved plan.
         $c = Read-RfConfig $plan.TargetConfigPath
-        if ($PauseAfterFiles -ge 0) { $PauseSignalPath = Get-RfPausePath $c $PauseSignalPath $plan.PackagePath }
+        if ($PauseAfterFiles -ge 0 -or $PauseAtPreparation) { $PauseSignalPath = Get-RfPausePath $c $PauseSignalPath $plan.PackagePath }
         $fresh = Get-RfPlanData $plan.PackagePath $c
         if ((Get-RfCanonical $fresh) -cne (Get-RfCanonical $plan)) { Stop-Rf 'PlanStale' 'Package, target definition, baseline or actual files changed; produce a new plan.' }
         if ($plan.NoOp) { return [pscustomobject]@{ Status = 'NoOp'; TargetId = $c.TargetId; Version = $plan.TargetVersion; RunId = $null } }
@@ -642,9 +663,11 @@ function Invoke-RfDeployment {
         $runRoot = Join-Path $c.StatePath "runs/$id"
         [void][IO.Directory]::CreateDirectory($runRoot)
         $initial = Get-RfServices $c
+        $previous = Get-RfCurrent $c
+        $previousRunId = $null; if ($null -ne $previous) { $previousRunId = $previous.RunId }
         $run = [ordered]@{
-            SchemaVersion = 1; ToolVersion = $script:RfToolVersion; RunId = $id; TargetId = $c.TargetId
-            ProductionPath = $c.ProductionPath; TargetConfigSha256 = $plan.TargetConfigSha256; PlanSha256 = $digest
+            SchemaVersion = 1; ToolVersion = $script:RfToolVersion; RunId = $id; TargetId = $c.TargetId; PreviousRunId = $previousRunId
+            ProductionPath = $c.ProductionPath; PackagePath = $plan.PackagePath; TargetConfigSha256 = $plan.TargetConfigSha256; PlanSha256 = $digest
             Status = 'Preparing'; CreatedUtc = [DateTime]::UtcNow.ToString('o'); UpdatedUtc = [DateTime]::UtcNow.ToString('o')
             Operator = [Environment]::UserName; SourceVersion = $plan.SourceVersion; TargetVersion = $plan.TargetVersion
             BaselineBefore = Read-RfBaseline $c; BaselineAfter = $null; BeforeManagedFiles = $plan.ActualManagedFiles
@@ -662,6 +685,7 @@ function Invoke-RfDeployment {
         # A self-contained recovery record does not rely on the delivery package.
         Write-RfJson (Join-Path $runRoot 'plan.json') $plan
         Save-RfRecoveryTools $c $runRoot
+        if ($PauseAtPreparation) { Suspend-RfTestProcess $PauseSignalPath $run }
         Set-RfPhase $c $run 'Stopping'; Set-RfServices $c $run $false ([bool]$FailServiceStop)
         Set-RfPhase $c $run 'BackingUp'
         Assert-RfInventoryEqual $run.BeforeManagedFiles (Get-RfManaged $c) 'Drift'
@@ -752,18 +776,23 @@ function Invoke-RfRecovery {
     if (-not $ConfirmExecution) { Stop-Rf 'ConfirmationRequired' 'Supply -ConfirmExecution to restore the latest eligible run.' }
     $c = Read-RfConfig $TargetConfigPath; $lock = Enter-RfLock $c; $run = $null
     try {
-        $run = Get-RfCurrent $c
-        if ($PauseAfterFiles -ge 0) { $PauseSignalPath = Get-RfPausePath $c $PauseSignalPath }
+        $indexed = Get-RfCurrent $c
+        $run = Get-RfRecoveryCandidate $c
         if ($null -eq $run -or $run.Status -in @('Recovered','AutoRecovered','Aborted')) { Stop-Rf 'RecoveryNotEligible' 'No latest unrecovered operation.' }
         if (@(Get-RfPendingRuns $c | Where-Object { $_.RunId -ne $run.RunId }).Count -gt 0) { Stop-Rf 'IncompleteRun' 'An orphan unfinished run needs resolution before recovery of the indexed run.' }
         if ($run.SchemaVersion -ne 1 -or $run.ToolVersion -ne $script:RfToolVersion -or $run.TargetId -cne $c.TargetId -or $run.ProductionPath -ne $c.ProductionPath) { Stop-Rf 'IncompatibleRecovery' 'Recovery schema/tool/target mismatch.' }
         if ($run.TargetConfigSha256 -ne (Get-RfHash $c._ConfigPath)) { Stop-Rf 'ConfigChanged' 'Recovery requires the unchanged target definition.' }
+        if ($PauseAfterFiles -ge 0) { $PauseSignalPath = Get-RfPausePath $c $PauseSignalPath $run.PackagePath }
         $baseline = Read-RfBaseline $c
         if ($run.Status -eq 'Succeeded' -and $baseline.LatestRunId -ne $run.RunId) { Stop-Rf 'RecoveryNotEligible' 'Run was superseded.' }
         # During commit, baseline may be old or new; no third recorded baseline accepted.
         $isOld = (Get-RfCanonical $baseline) -ceq (Get-RfCanonical $run.BaselineBefore)
         $isNew = $null -ne $run.BaselineAfter -and (Get-RfCanonical $baseline) -ceq (Get-RfCanonical $run.BaselineAfter)
         if (-not $isOld -and -not $isNew) { Stop-Rf 'BaselineChanged' 'Baseline is not a known state of the latest run.' }
+        if ($null -ne $indexed -and $indexed.RunId -ne $run.RunId) {
+            # Commit the eligible index before restoration so an interrupted recovery resumes it.
+            Write-RfJson (Join-Path $c.StatePath 'current.json') @{ SchemaVersion=1; TargetId=$c.TargetId; RunId=$run.RunId }
+        }
         Restore-RfRun $c $run $false $FailAfterFiles $PauseAfterFiles $PauseSignalPath
         return [pscustomobject]$run
     } catch {

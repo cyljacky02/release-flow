@@ -12,6 +12,26 @@ function Check([bool]$Condition,[string]$Name) {
 function Throws([scriptblock]$Action) {
     try { & $Action | Out-Null; return $false } catch { Write-Host "Rejected: $($_.Exception.Message)"; return $true }
 }
+function Invoke-KilledPreparation($Fixture,[string]$PlanPath) {
+    $signal=Join-Path $Fixture.Root 'preparation.signal'
+    $scriptPath=Join-Path $Fixture.Root 'preparation-child.ps1'
+    $module=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../src/ReleaseFlow.psm1')).Replace("'","''")
+    $quotedPlan=$PlanPath.Replace("'","''");$quotedSignal=$signal.Replace("'","''")
+    "`$ErrorActionPreference='Stop'`nImport-Module '$module' -Force`nInvoke-RfDeployment -PlanPath '$quotedPlan' -ConfirmExecution -PauseAtPreparation -PauseSignalPath '$quotedSignal' | Out-Null" | Set-Content $scriptPath -Encoding UTF8
+    $process=Start-Process -FilePath (Get-Command powershell.exe).Source -ArgumentList ('-NoProfile -NonInteractive -File "' + $scriptPath + '"') -PassThru -RedirectStandardOutput (Join-Path $Fixture.Root 'preparation.out.log') -RedirectStandardError (Join-Path $Fixture.Root 'preparation.err.log')
+    $clock=[Diagnostics.Stopwatch]::StartNew()
+    try {
+        while (-not (Test-Path $signal)) {
+            $process.Refresh()
+            if ($process.HasExited -or $clock.Elapsed.TotalSeconds -gt 20) { throw 'Child did not reach the preparation checkpoint; inspect fixture logs.' }
+            Start-Sleep -Milliseconds 50
+        }
+        $process.Kill(); if (-not $process.WaitForExit(5000)) { throw 'Child process did not exit.' }
+    } finally {
+        $process.Refresh();if(-not $process.HasExited){$process.Kill();[void]$process.WaitForExit(5000)}
+        $process.Dispose();$clock.Stop()
+    }
+}
 function New-Fixture([string]$Name) {
     $path=Join-Path $Root $Name
     $prod=Join-Path $path 'production'; $state=Join-Path $path 'state'
@@ -92,5 +112,48 @@ New-RfBaseline -TargetConfigPath $f.Config | Out-Null
 $unknown=Join-Path $f.State ('runs/' + [guid]::NewGuid().ToString())
 New-Item -ItemType Directory -Path $unknown -Force | Out-Null
 Check (Throws { New-RfPlan -PackagePath $f.New -TargetConfigPath $f.Config -OutputPath (Join-Path $f.Root 'plan.json') }) 'Run directory without durable journal blocks planning'
+# An untouched abort must not hide the still-current successful deployment.
+$f=New-Fixture 'abort-lineage'
+New-RfBaseline -TargetConfigPath $f.Config | Out-Null
+$plan=Join-Path $f.Root 'up.json'; New-RfPlan -PackagePath $f.New -TargetConfigPath $f.Config -OutputPath $plan | Out-Null
+Invoke-RfDeployment -PlanPath $plan -ConfirmExecution | Out-Null
+$successfulId=(Get-RfStatus -TargetConfigPath $f.Config).CurrentRun.RunId
+foreach($attempt in @(1,2)) {
+    $down=Join-Path $f.Root "abort-$attempt.json"
+    New-RfPlan -PackagePath $f.Old -TargetConfigPath $f.Config -OutputPath $down | Out-Null
+    Check (Throws { Invoke-RfDeployment -PlanPath $down -ConfirmExecution -FailServiceStop }) "Untouched aborted attempt $attempt is reported"
+}
+$status=Get-RfStatus -TargetConfigPath $f.Config
+Check ($status.CurrentRun.Status -eq 'Aborted' -and $status.Baseline.LatestRunId -eq $successfulId) 'Untouched abort leaves successful deployed baseline current'
+$recovered=$false
+try { $result=Invoke-RfRecovery -TargetConfigPath $f.Config -ConfirmExecution; $recovered=($result.Status -eq 'Recovered' -and $result.RunId -eq $successfulId) }
+catch { Write-Host "Recovery rejected: $_" }
+Check $recovered 'Recovery skips untouched aborts to still-current successful deployment'
+Check ((Get-Content (Join-Path $f.Production 'bin/version.txt') -Raw) -eq 'old') 'Recovery after abort restores original version'
+Check (@(Get-ChildItem (Join-Path $f.State 'runs') -Directory).Count -eq 3) 'Aborted journals remain preserved after recovery'
+Check (Throws { Invoke-RfRecovery -TargetConfigPath $f.Config -ConfirmExecution }) 'Recovery after abort does not permit historical rollback traversal'
+$afterRecovery=Join-Path $f.Root 'abort-after-recovery.json'
+New-RfPlan -PackagePath $f.New -TargetConfigPath $f.Config -OutputPath $afterRecovery | Out-Null
+Check (Throws { Invoke-RfDeployment -PlanPath $afterRecovery -ConfirmExecution -FailServiceStop }) 'Untouched attempt after completed recovery is reported'
+Check (Throws { Invoke-RfRecovery -TargetConfigPath $f.Config -ConfirmExecution }) 'An abort cannot skip a completed recovery to unlock older history'
+Check ((Get-Content (Join-Path $f.Production 'bin/version.txt') -Raw) -eq 'old') 'Blocked historical traversal never mutates restored application'
+# Indexed Preparing -> Aborted must retain that same recovery eligibility.
+$f=New-Fixture 'preparation-lineage'
+New-RfBaseline -TargetConfigPath $f.Config | Out-Null
+$up=Join-Path $f.Root 'up.json';New-RfPlan -PackagePath $f.New -TargetConfigPath $f.Config -OutputPath $up | Out-Null
+Invoke-RfDeployment -PlanPath $up -ConfirmExecution | Out-Null
+$successfulId=(Get-RfStatus -TargetConfigPath $f.Config).CurrentRun.RunId
+$down=Join-Path $f.Root 'down.json';New-RfPlan -PackagePath $f.Old -TargetConfigPath $f.Config -OutputPath $down | Out-Null
+Invoke-KilledPreparation $f $down
+$status=Get-RfStatus -TargetConfigPath $f.Config
+Check ($status.CurrentRun.Status -eq 'Preparing') 'Killed child leaves indexed untouched preparation'
+$preparationId=$status.CurrentRun.RunId
+Resolve-RfPreparation -TargetConfigPath $f.Config -RunId $preparationId -ConfirmExecution | Out-Null
+$result=Invoke-RfRecovery -TargetConfigPath $f.Config -ConfirmExecution
+Check ($result.RunId -eq $successfulId -and $result.Status -eq 'Recovered') 'Resolved preparation preserves previous successful deployment recovery'
+Check ((Get-Content (Join-Path $f.Production 'bin/version.txt') -Raw) -eq 'old') 'Recovery after resolved preparation restores original version'
+$journal=Get-Content (Join-Path $f.State "runs/$preparationId/journal.json") -Raw | ConvertFrom-Json
+Check ($journal.Status -eq 'Aborted') 'Resolved preparation journal is retained'
+Check (Throws { Invoke-RfRecovery -TargetConfigPath $f.Config -ConfirmExecution }) 'Resolved preparation does not unlock historical traversal'
 Write-Host "$script:passed safety assertions passed; $($script:failures.Count) failed. Fixtures: $Root"
 if ($script:failures.Count) { throw ($script:failures -join '; ') }

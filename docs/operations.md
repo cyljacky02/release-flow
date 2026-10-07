@@ -58,7 +58,7 @@ $plan = Join-Path $root 'approved-plan.json'
 - 來源漂移、錯誤目標或核准後變更會阻擋；修正原因並重新審查／產生計畫，不強制覆蓋。
 - 先停止模擬服務，再建立快照／復原資料，最後才套用異動。
 - 嘗試啟動目標版本前的檔案失敗可自動復原；啟動後驗證失敗保留待處理狀態，需明確執行復原。
-- 只撤銷最近一次符合資格的操作，不跨多次歷史倒帶。
+- 只撤銷最近一次符合資格的操作，不跨多次歷史倒帶。未改應用的 `Aborted` attempt 不會取代前一次成功部署的復原資格；工具驗證保留的 lineage 與現場後跳過它，保留所有 journal，且不越過已完成的 recovery。
 - 升版與降版皆可撤銷；復原回到本次開始前的实际檔案狀態。
 - `.work/.../targets/<TargetId>/state` 保留 baseline、runs、操作紀錄與備份；不要手動移除未完成操作資料。`Status.PendingRuns` 包含 orphan journals，不能只看 `CurrentRun`。
 - 若 pointer 寫入失敗留下一筆完全未碰應用或服務的 `Preparing` run，可在確認原始 inventory、baseline、服務及設定未變後，明確執行 `ResolvePreparation`：

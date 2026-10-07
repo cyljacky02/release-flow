@@ -246,4 +246,22 @@ Assert-True ((Get-TestInventory $f.Production) -cne $f.Before -and -not $s.Servi
 Assert-Blocked $f 'Start failure'
 Invoke-RfRecovery -TargetConfigPath $f.Config -ConfirmExecution | Out-Null
 Assert-Recovered $f 'Start failure explicit recovery'
+# Recovering through an untouched-abort lineage must survive a killed recovery too.
+$f = New-TestFixture 'abort-lineage-recovery-killed'
+$downgrade = Join-Path $f.Home 'downgrade-package'
+[void][IO.Directory]::CreateDirectory((Join-Path $downgrade 'app'))
+Copy-Item (Join-Path $f.Production 'bin') (Join-Path $downgrade 'app') -Recurse
+@{SchemaVersion=1;TargetId='interruption-test';Version='1.0.0';Commit='original-fixture';ToolVersion=(Get-RfToolVersion)} | ConvertTo-Json | Set-Content (Join-Path $downgrade 'package.json') -Encoding UTF8
+New-RfManifest -Root (Join-Path $downgrade 'app') -OutputPath (Join-Path $downgrade 'manifest.json') | Out-Null
+Invoke-RfDeployment -PlanPath $f.Plan -ConfirmExecution | Out-Null
+$successfulId=(Get-RfStatus -TargetConfigPath $f.Config).CurrentRun.RunId
+$downPlan=Join-Path $f.Home 'downgrade-plan.json'
+New-RfPlan -PackagePath $downgrade -TargetConfigPath $f.Config -OutputPath $downPlan | Out-Null
+Assert-Rejected { Invoke-RfDeployment -PlanPath $downPlan -ConfirmExecution -FailServiceStop } 'Untouched downgrade abort reported before lineage recovery'
+Invoke-KilledChild $f 'Recover'
+$s=Assert-Pending $f 'Recovering' 'Killed lineage recovery'
+Assert-True ($s.CurrentRun.RunId -eq $successfulId) 'Eligible successful run is indexed before any recovery file mutations'
+Assert-Blocked $f 'Killed lineage recovery'
+Invoke-RfRecovery -TargetConfigPath $f.Config -ConfirmExecution | Out-Null
+Assert-Recovered $f 'Resumed lineage recovery'
 Write-Host "All $script:passed assertions passed. Fixtures retained at $Root"
