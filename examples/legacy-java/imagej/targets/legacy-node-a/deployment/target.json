@@ -1,0 +1,5 @@
+{
+  "TargetId": "legacy-node-a",
+  "Scope": "Synthetic deployment metadata; not an ImageJ application setting",
+  "Phase": "updated"
+}

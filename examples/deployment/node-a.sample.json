@@ -1,0 +1,16 @@
+{
+  "SchemaVersion": 1,
+  "TargetId": "node-a",
+  "ProductionPath": "C:/release-flow-demo/node-a/production",
+  "StatePath": "C:/release-flow-demo/node-a/state",
+  "ManagedPaths": ["bin", "config/app.json"],
+  "ProtectedPaths": ["data", "config/local.json"],
+  "ServiceMode": "Simulated",
+  "Services": [
+    { "Name": "worker", "InitiallyRunning": true },
+    { "Name": "optional", "InitiallyRunning": false }
+  ],
+  "StopOrder": ["worker", "optional"],
+  "StartOrder": ["optional", "worker"],
+  "HealthCheck": { "Mode": "Simulated", "Fail": false }
+}

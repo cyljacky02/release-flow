@@ -1,0 +1,70 @@
+# Windows shell-runner SAMPLE. Does not perform production deployment.
+# Configure a runner with shell = "powershell" and tag windows-powershell.
+stages: [build, package, delivery]
+
+variables:
+  RELEASE_VERSION: "2.0.0"
+  RELEASE_DELIVERY_ENABLED: "false"
+
+build_application:
+  stage: build
+  tags: [windows-powershell]
+  script:
+    - '& ./scripts/Build.ps1 -Version $env:RELEASE_VERSION -Commit $env:CI_COMMIT_SHA -OutputPath .ci/build'
+  artifacts:
+    paths: [.ci/build/]
+    expire_in: 14 days
+
+.package_target:
+  stage: package
+  tags: [windows-powershell]
+  needs:
+    - job: build_application
+      artifacts: true
+  script:
+    - '& ./scripts/Package.ps1 -BuildPath .ci/build -TargetId $env:TARGET_ID -TargetFilesPath "examples/targets/$($env:TARGET_ID)" -OutputPath ".ci/packages/$($env:TARGET_ID)"'
+  artifacts:
+    name: "release-$CI_PIPELINE_ID-$TARGET_ID"
+    paths: [".ci/packages/$TARGET_ID/"]
+    expire_in: 14 days
+
+package_node_a:
+  extends: .package_target
+  variables:
+    TARGET_ID: node-a
+
+package_node_b:
+  extends: .package_target
+  variables:
+    TARGET_ID: node-b
+
+.deliver_target:
+  stage: delivery
+  tags: [windows-powershell]
+  rules:
+    - if: '$RELEASE_DELIVERY_ENABLED == "true"'
+      when: manual
+    - when: never
+  script:
+    - |
+      if ([string]::IsNullOrWhiteSpace($env:RELEASE_INBOX_BASE)) { throw 'Set RELEASE_INBOX_BASE to an approved inbox, never the production path.' }
+      $zip = ".ci/packages/$($env:TARGET_ID)/$($env:TARGET_ID).zip"
+      $hash = (Get-Content "$zip.sha256" -Raw).Trim()
+      $destination = Join-Path $env:RELEASE_INBOX_BASE "$($env:TARGET_ID)/$($env:CI_PIPELINE_ID)"
+      & ./scripts/Deliver.ps1 -ArchivePath $zip -ExpectedSha256 $hash -DestinationPath $destination
+
+deliver_node_a:
+  extends: .deliver_target
+  variables:
+    TARGET_ID: node-a
+  needs:
+    - job: package_node_a
+      artifacts: true
+
+deliver_node_b:
+  extends: .deliver_target
+  variables:
+    TARGET_ID: node-b
+  needs:
+    - job: package_node_b
+      artifacts: true
